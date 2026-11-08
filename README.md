@@ -11,6 +11,7 @@ Live-preview vertical taskbar for Windows 11 (also runs on Windows 10). A siblin
 - **Pinned apps** (your own, plus your Windows Start menu pins) and a `░▒▓█` **start button** at the very bottom
 - **2-bit icons.** Each app's real icon reduced to transparent plus three grey shades, optionally dithered.
 - **Per-app audio meter.** A thin bar along the bottom of any preview whose app is playing sound.
+- **System tray.** A small well of the familiar Windows indicators between the pinned apps and the clock: speaker volume (wheel to change, click to mute), network (Wi‑Fi strength or a wired plug, with a warning dot when there's no internet), and battery (laptops only). Hover any of them for details; click through to the matching Windows settings.
 - **Attention flashing.** A window asking for attention blinks, then stays lit until you switch to it.
 - **Right-click menus:** restore, minimize, maximize, close, end process, open file location, run as administrator
 - Reserves its screen edge like the real taskbar, so maximized windows stop beside it
@@ -56,6 +57,8 @@ Everything lives in `pbar.ini` next to the exe. The settings window (right-click
 
 **Start button & pins:** `startbutton`, `startlines`, `startheight` (px, wins over `startlines`), `startcolor`, `pin=Name|path|args|workingdir` (env vars allowed), `startpins` (import Windows Start pins), `pindir` (a folder of shortcuts), `pinsmax` (max % of bar height)
 
+**System tray:** `systray` (the whole well), `sysvolume`, `sysnetwork`, `sysbattery`, `systileh` (row height px), `volumestep` (% the wheel changes the volume), `sysface` (tile colour, blank = same as the pinned apps)
+
 **Colours:** `bg`, `face`, `outline`, `hi`, `activeface`, `pinface`, `clockface`, `text`, `hovertext`, `activetext`, `dim`, `flash`, `flashrate`, `flashcount`, `scrollw`, `scrollcolor`
 
 **Icons:** `icons`, `iconsize` (0 = text line height), `iconpad`, `icondither`, `iconshades` (three colours, darkest to lightest)
@@ -64,7 +67,7 @@ Everything lives in `pbar.ini` next to the exe. The settings window (right-click
 
 ## Building
 
-Single file: Win32, GDI, GDI+, DWM thumbnails and WASAPI, no other dependencies.
+Single file: Win32, GDI, GDI+, DWM thumbnails, WASAPI, and the Windows network/WLAN/power APIs, no other dependencies.
 
 MSVC (x64 Native Tools prompt):
 ```
@@ -73,7 +76,7 @@ cl /O2 /EHsc /DUNICODE /D_UNICODE pbar.cpp /link /SUBSYSTEM:WINDOWS
 
 MinGW-w64:
 ```
-g++ -O2 -municode -mwindows -static pbar.cpp -o pbar.exe -ldwmapi -lgdi32 -luser32 -lshell32 -lole32 -luuid -lmsimg32 -ladvapi32 -lgdiplus -lcomdlg32
+g++ -O2 -municode -mwindows -static pbar.cpp -o pbar.exe -ldwmapi -lgdi32 -luser32 -lshell32 -lole32 -luuid -lmsimg32 -ladvapi32 -lgdiplus -lcomdlg32 -lwlanapi -liphlpapi -lcomctl32
 ```
 
 ## License

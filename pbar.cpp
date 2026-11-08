@@ -44,6 +44,11 @@
 #include <array>
 #include <mmdeviceapi.h>
 #include <audiopolicy.h>
+#include <endpointvolume.h>
+#include <netlistmgr.h>
+#include <wlanapi.h>
+#include <iphlpapi.h>
+#include <commctrl.h>
 #include <objidl.h>
 namespace Gdiplus { using std::min; using std::max; }   // GDI+'s headers expect min/max (NOMINMAX removes them)
 #include <gdiplus.h>
@@ -58,14 +63,17 @@ namespace Gdiplus { using std::min; using std::max; }   // GDI+'s headers expect
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "wlanapi.lib")
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "comctl32.lib")
 #endif
 
 #ifndef MOD_NOREPEAT
 #define MOD_NOREPEAT 0x4000
 #endif
 
-#define PBAR_VERSION L"0.9"
-#define PBAR_CONFIGVER 4
+#define PBAR_VERSION L"1.0"
+#define PBAR_CONFIGVER 5
 
 #define WM_APPBAR    (WM_APP + 1)
 #define WM_STARTPINS (WM_APP + 2)
@@ -82,6 +90,7 @@ namespace Gdiplus { using std::min; using std::max; }   // GDI+'s headers expect
 #define TIMER_RECENTER 8
 #define TIMER_CARET 9
 #define TIMER_TERMEXIT 10
+#define TIMER_SYS 12
 #define HOTKEY_TERM 1
 #define IDM_RELOAD 100
 #define IDM_EDIT 101
@@ -116,7 +125,9 @@ namespace Gdiplus { using std::min; using std::max; }   // GDI+'s headers expect
 #define IDM_TERM_SH_PWSH   411
 #define IDM_TERM_SH_CMD    412
 
-enum Kind { K_PIN = 0, K_TASK = 1, K_CLOCK = 2, K_START = 3, K_TERM = 4, K_NONE = -1 };
+enum Kind { K_PIN = 0, K_TASK = 1, K_CLOCK = 2, K_START = 3, K_TERM = 4, K_SYS = 5, K_NONE = -1 };
+// K_SYS row idx: which indicator tile the row is
+enum SysTile { SYS_VOL = 0, SYS_NET = 1, SYS_BAT = 2 };
 
 // A 2-bit icon: every pixel is transparent or one of three grey shades, stored ready to AlphaBlend.
 struct Icon2 { HBITMAP bmp = nullptr; int size = 0; ~Icon2() { if (bmp) DeleteObject(bmp); } };
@@ -155,7 +166,7 @@ struct Item { int kind; int idx; std::vector<std::wstring> lines; int h; };
 
 struct Config {
     int width = 150, gap = 6, spacing = 2, pad = 4, vpad = 2, lineGap = 0, maxLines = 3;
-    int highlight = 4, fontSize = 12, fontWeight = 400, pinsMax = 35, hoverDelay = 0, borderMode = 1;
+    int highlight = 4, fontSize = 12, fontWeight = 400, pinsMax = 25, hoverDelay = 0, borderMode = 1;
     std::wstring font = L"Consolas", fontFile, pinDir;
     bool aa = false, clock = true, hideTaskbar = false, ellipsis = true, startPins = true, italic = false;
     bool bold = false, hoverRestore = false, hoverFocus = false, meter = true, rightSide = false;
@@ -168,6 +179,11 @@ struct Config {
     COLORREF startColor = RGB(216, 216, 216);
     bool startColorSet = false;
     int meterH = 2, meterFall = 4, meterDb = 48, meterFps = 30;
+    // system indicators (volume / network / battery), in a well between the pins and the clock
+    bool sysTray = true, sysVolume = true, sysNetwork = true, sysBattery = true;
+    int sysTileH = 24, volumeStep = 4;
+    COLORREF sysFace = RGB(64, 64, 64);
+    bool sysFaceSet = false;
     COLORREF bg = RGB(0, 0, 0), face = RGB(64, 64, 64), text = RGB(216, 216, 216),
              hi = RGB(255, 255, 255), dim = RGB(136, 136, 136), flash = RGB(110, 110, 110),
              outline = RGB(0, 0, 0), hoverText = RGB(255, 255, 255), activeText = RGB(255, 255, 255),
@@ -219,6 +235,7 @@ static std::vector<Pin> g_startPins;
 static std::vector<Row> g_rows;
 static int g_scrollPins = 0, g_lineH = 14, g_termLineH = 14;
 static int g_pinsTop = 0, g_pinsBottom = 0;
+static int g_sysTop = 0, g_sysBottom = 0;      // system-indicator well extent, for wheel hit-testing
 static int g_hoverKind = K_NONE, g_hoverIdx = -1;
 static bool g_tracking = false;
 static UINT g_shellMsg = 0, g_taskbarCreatedMsg = 0;
@@ -738,14 +755,30 @@ static const char* kDefaultIni =
 "; 1 = include your Windows Start menu pins (read via Export-StartLayout; falls back to taskbar pins)\n"
 "startpins=1\n"
 "; most of the bar's height the pinned section may take, in percent (it scrolls past that)\n"
-"pinsmax=35\n"
+"pinsmax=25\n"
 "; your own pins, listed first: pin=Name|path|args|working dir   (env vars like %USERPROFILE% work)\n"
 "; pin=Terminal|wt.exe\n"
 "; optional folder of shortcuts (.lnk/.url/.exe), listed alphabetically after the pin= lines\n"
 "pindir=\n"
 "\n"
+"; ---- system tray (between the pinned apps and the clock) ----\n"
+"; a small well of Windows indicators: speaker volume, network, and battery\n"
+"systray=1\n"
+"; speaker volume: wheel over it to change, left-click to mute/unmute, right-click for sound settings\n"
+"sysvolume=1\n"
+"; network: wifi strength or a wired plug; left-click opens network settings, right-click the wifi list\n"
+"sysnetwork=1\n"
+"; battery charge and charging state (shows only on a laptop); left-click opens power settings\n"
+"sysbattery=1\n"
+"; height of the indicator row in px\n"
+"systileh=24\n"
+"; how many percent one wheel notch changes the volume\n"
+"volumestep=4\n"
+"; face colour of the indicator well (blank = same as the pinned buttons)\n"
+"; sysface=#404040\n"
+"\n"
 "; ini format version (pbar updates older files itself)\n"
-"configver=4\n";
+"configver=5\n";
 
 static void SetIniValue(const std::wstring& key, const std::wstring& value);
 
@@ -778,7 +811,7 @@ static void LoadConfig() {
     }
     std::wstring text = DecodeText(raw);
 
-    bool sawPopOut = false, sawTermSel = false, sawWatch = false, sawStartLines = false;
+    bool sawPopOut = false, sawTermSel = false, sawWatch = false, sawStartLines = false, sawSysTray = false;
     std::wstringstream ws(text);
     std::wstring line;
     while (std::getline(ws, line)) {
@@ -840,6 +873,13 @@ static void LoadConfig() {
         else if (k == L"monitor")     g_cfg.monitor = std::max(0, n);   // "primary" parses as 0
         else if (k == L"startpins")   g_cfg.startPins = n != 0;
         else if (k == L"pinsmax")     g_cfg.pinsMax = std::max(10, std::min(100, n));
+        else if (k == L"systray")     { g_cfg.sysTray = n != 0; sawSysTray = true; }
+        else if (k == L"sysvolume")   g_cfg.sysVolume = n != 0;
+        else if (k == L"sysnetwork")  g_cfg.sysNetwork = n != 0;
+        else if (k == L"sysbattery")  g_cfg.sysBattery = n != 0;
+        else if (k == L"systileh")    g_cfg.sysTileH = std::max(14, std::min(64, n));
+        else if (k == L"volumestep")  g_cfg.volumeStep = std::max(1, std::min(25, n));
+        else if (k == L"sysface")     { g_cfg.sysFace = ParseColor(v, g_cfg.sysFace); g_cfg.sysFaceSet = true; }
         else if (k == L"bg")          g_cfg.bg = ParseColor(v, g_cfg.bg);
         else if (k == L"face")        g_cfg.face = ParseColor(v, g_cfg.face);
         else if (k == L"text")        g_cfg.text = ParseColor(v, g_cfg.text);
@@ -948,6 +988,22 @@ static void LoadConfig() {
                           L"; start button height in text lines, the same as a button with that many lines (1 to 4)\r\n"
                           L"startlines=2\r\n");
         }
+        if (g_cfg.configVer < 5) {
+            if (g_cfg.pinsMax == 35) { SetIniValue(L"pinsmax", L"25"); g_cfg.pinsMax = 25; }   // make room for the tray
+            if (!sawSysTray)
+                AppendIniText(L"\r\n; ---- added by a pbar update: system tray ----\r\n"
+                              L"; a little well of Windows indicators between the pinned apps and the clock\r\n"
+                              L"systray=1\r\n"
+                              L"; which indicators to show\r\n"
+                              L"sysvolume=1\r\n"
+                              L"sysnetwork=1\r\n"
+                              L"; battery shows only on a laptop\r\n"
+                              L"sysbattery=1\r\n"
+                              L"; height of the indicator row in px\r\n"
+                              L"systileh=24\r\n"
+                              L"; how many % the wheel changes the volume by over the speaker\r\n"
+                              L"volumestep=4\r\n");
+        }
         SetIniValue(L"configver", std::to_wstring(PBAR_CONFIGVER));
         g_cfg.configVer = PBAR_CONFIGVER;
     }
@@ -959,6 +1015,7 @@ static void LoadConfig() {
     if (!g_cfg.activeFaceSet) g_cfg.activeFace = g_cfg.face;
     if (!g_cfg.pinFaceSet)    g_cfg.pinFace = g_cfg.face;
     if (!g_cfg.clockFaceSet)  g_cfg.clockFace = g_cfg.face;
+    if (!g_cfg.sysFaceSet)    g_cfg.sysFace = g_cfg.pinFace;
 
     if (!g_cfg.pinDir.empty()) {
         auto found = ListShortcutDir(Resolve(g_cfg.pinDir));
@@ -3331,6 +3388,9 @@ static void WatchPlace(const RECT* r) {
 
 // ---------- paint ----------
 
+static int SysTileCount();                      // system-indicator well (defined after the audio section)
+static void DrawSysTray(HDC dc, RECT well);
+
 static void Paint(HWND hwnd) {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hwnd, &ps);
@@ -3404,8 +3464,15 @@ static void Paint(HWND hwnd) {
                : watch ? std::min(g_cfg.watchHeight, std::max(40, H / 3))
                : 2 + 2 * g_cfg.vpad + (int)clockLines.size() * clockLineH + ((int)clockLines.size() - 1) * g_cfg.lineGap;
     int clockTop = (g_cfg.startButton ? startTop - g_cfg.spacing : H) - clockH;
-    int bottomLimit = g_cfg.clock ? clockTop - g_cfg.gap
-                    : g_cfg.startButton ? startTop - g_cfg.gap : H;
+    int belowPins = g_cfg.clock ? clockTop - g_cfg.gap
+                  : g_cfg.startButton ? startTop - g_cfg.gap : H;
+    // System-indicator well, carved just above the clock; the pinned section stops above it.
+    int sysN = SysTileCount();
+    int sysH = (g_cfg.sysTray && sysN > 0) ? std::min(g_cfg.sysTileH, std::max(0, belowPins / 3)) : 0;
+    int sysBot = belowPins, sysTopY = belowPins - sysH;
+    int bottomLimit = sysH ? sysTopY - g_cfg.gap : belowPins;
+    g_sysTop = sysH ? sysTopY : 0;
+    g_sysBottom = sysH ? sysBot : 0;
 
     int termH = g_cfg.terminal ? std::min(TermHeight(), std::max(0, bottomLimit / 2)) : 0;
     g_termRect = RECT{0, 0, W, termH};
@@ -3445,6 +3512,7 @@ static void Paint(HWND hwnd) {
     DrawPreviews(mdc);
     DrawPins(mdc, W, pinsScroll ? nx0 : 0, pinsScroll ? nx1 : W, pins, g_pinsTop, g_pinsBottom,
              g_scrollPins, pinsContent, pinsScroll ? sbX : -1);
+    if (sysH) { RECT sw{0, sysTopY, W, sysBot}; DrawSysTray(mdc, sw); }
 
     if (g_cfg.clock) {
         RECT r{0, clockTop, W, clockTop + clockH};
@@ -3632,6 +3700,382 @@ static void StartMeterTimer() {
     else for (auto& t : g_tasks) t.level = 0;
 }
 
+// ---------- system indicators: volume, network, battery ----------
+// A small well of the familiar Windows status icons, shown between the pinned apps and the clock:
+//   - speaker volume   (wheel = change, left-click = mute/unmute, right-click = sound settings)
+//   - network          (wi-fi strength or a wired plug; click = network settings / wi-fi list)
+//   - battery          (charge + charging, laptops only; click = power settings)
+// All read through public APIs (Core Audio, the Network List Manager, the WLAN API, GetSystemPowerStatus);
+// nothing here touches other apps or the real taskbar.
+
+static const GUID kIID_IAudioEndpointVolume = {0x5CDF2C82, 0x841E, 0x4546, {0x97, 0x22, 0x0C, 0xF7, 0x40, 0x78, 0x22, 0x9A}};
+static const GUID kCLSID_NetworkListManager = {0xDCB00C01, 0x570F, 0x4A9B, {0x8D, 0x69, 0x19, 0x9F, 0xDB, 0xA5, 0x72, 0x3B}};
+static const GUID kIID_INetworkListManager  = {0xDCB00000, 0x570F, 0x4A9B, {0x8D, 0x69, 0x19, 0x9F, 0xDB, 0xA5, 0x72, 0x3B}};
+
+struct SysState {
+    bool haveVol = false; int vol = 0; bool mute = false;      // volume 0..100
+    int net = 0;                 // 0 disconnected, 1 connected but no internet, 2 internet
+    int netType = 0;             // 0 wired / none, 1 wi-fi
+    int wifiQual = 0;            // 0..100 when on wi-fi
+    std::wstring ssid;
+    bool haveBat = false; int bat = 0; bool charging = false, acLine = false;
+};
+static SysState g_sys;
+static IAudioEndpointVolume* g_epv = nullptr;
+static DWORD g_epvAt = 0;
+static INetworkListManager* g_nlm = nullptr;
+
+static IAudioEndpointVolume* VolGet() {
+    DWORD now = GetTickCount();
+    if (g_epv && now - g_epvAt < 3000) return g_epv;        // re-acquire now and then to follow the default device
+    if (g_epv) { g_epv->Release(); g_epv = nullptr; }
+    if (!g_mmEnum && FAILED(CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
+                                             kIID_IMMDeviceEnumerator, (void**)&g_mmEnum))) {
+        g_mmEnum = nullptr;
+        return nullptr;
+    }
+    IMMDevice* dev = nullptr;
+    if (g_mmEnum && SUCCEEDED(g_mmEnum->GetDefaultAudioEndpoint(eRender, eConsole, &dev)) && dev) {
+        if (FAILED(dev->Activate(kIID_IAudioEndpointVolume, CLSCTX_ALL, nullptr, (void**)&g_epv))) g_epv = nullptr;
+        dev->Release();
+    }
+    g_epvAt = now;
+    return g_epv;
+}
+static void VolDrop() { if (g_epv) { g_epv->Release(); g_epv = nullptr; } g_epvAt = 0; }
+
+static void SysPollVolume() {
+    g_sys.haveVol = false;
+    IAudioEndpointVolume* v = VolGet();
+    if (!v) return;
+    float s = 0; BOOL m = FALSE;
+    if (SUCCEEDED(v->GetMasterVolumeLevelScalar(&s)) && SUCCEEDED(v->GetMute(&m))) {
+        g_sys.haveVol = true;
+        g_sys.vol = (int)std::lround(s * 100.0f);
+        g_sys.mute = !!m;
+    } else VolDrop();
+}
+static void SysVolumeNudge(int dir) {                 // dir = +1 / -1 wheel notches
+    IAudioEndpointVolume* v = VolGet();
+    if (!v) return;
+    float s = 0;
+    if (FAILED(v->GetMasterVolumeLevelScalar(&s))) { VolDrop(); return; }
+    float ns = std::max(0.0f, std::min(1.0f, s + dir * (g_cfg.volumeStep / 100.0f)));
+    v->SetMasterVolumeLevelScalar(ns, nullptr);
+    if (dir > 0) { BOOL m = FALSE; if (SUCCEEDED(v->GetMute(&m)) && m) { v->SetMute(FALSE, nullptr); } g_sys.mute = false; }
+    g_sys.haveVol = true;
+    g_sys.vol = (int)std::lround(ns * 100.0f);
+}
+static void SysVolumeMuteToggle() {
+    IAudioEndpointVolume* v = VolGet();
+    if (!v) return;
+    BOOL m = FALSE;
+    if (SUCCEEDED(v->GetMute(&m)) && SUCCEEDED(v->SetMute(!m, nullptr))) g_sys.mute = !m;
+}
+
+static void SysPollNetwork() {
+    if (!g_nlm) CoCreateInstance(kCLSID_NetworkListManager, nullptr, CLSCTX_ALL,
+                                 kIID_INetworkListManager, (void**)&g_nlm);
+    g_sys.net = 0;
+    if (g_nlm) {
+        NLM_CONNECTIVITY c = NLM_CONNECTIVITY_DISCONNECTED;
+        if (SUCCEEDED(g_nlm->GetConnectivity(&c))) {
+            bool inet  = (c & (NLM_CONNECTIVITY_IPV4_INTERNET | NLM_CONNECTIVITY_IPV6_INTERNET)) != 0;
+            bool local = (c & (NLM_CONNECTIVITY_IPV4_LOCALNETWORK | NLM_CONNECTIVITY_IPV6_LOCALNETWORK |
+                               NLM_CONNECTIVITY_IPV4_SUBNET | NLM_CONNECTIVITY_IPV6_SUBNET)) != 0;
+            g_sys.net = inet ? 2 : local ? 1 : 0;
+        }
+    }
+    // wi-fi SSID + signal, best-effort (the WLAN AutoConfig service may be off, or there may be no radio)
+    g_sys.netType = 0; g_sys.wifiQual = 0; g_sys.ssid.clear();
+    HANDLE h = nullptr; DWORD ver = 0;
+    if (WlanOpenHandle(2, nullptr, &ver, &h) == ERROR_SUCCESS && h) {
+        WLAN_INTERFACE_INFO_LIST* list = nullptr;
+        if (WlanEnumInterfaces(h, nullptr, &list) == ERROR_SUCCESS && list) {
+            for (DWORD i = 0; i < list->dwNumberOfItems; ++i) {
+                if (list->InterfaceInfo[i].isState != wlan_interface_state_connected) continue;
+                WLAN_CONNECTION_ATTRIBUTES* ca = nullptr; DWORD sz = 0;
+                if (WlanQueryInterface(h, &list->InterfaceInfo[i].InterfaceGuid,
+                                       wlan_intf_opcode_current_connection, nullptr, &sz, (void**)&ca, nullptr)
+                        == ERROR_SUCCESS && ca) {
+                    g_sys.netType = 1;
+                    g_sys.wifiQual = (int)ca->wlanAssociationAttributes.wlanSignalQuality;
+                    const DOT11_SSID& s = ca->wlanAssociationAttributes.dot11Ssid;
+                    if (s.uSSIDLength) {
+                        wchar_t buf[64] = {0};
+                        int n = MultiByteToWideChar(CP_UTF8, 0, (const char*)s.ucSSID, (int)s.uSSIDLength, buf, 63);
+                        if (n <= 0) n = MultiByteToWideChar(CP_ACP, 0, (const char*)s.ucSSID, (int)s.uSSIDLength, buf, 63);
+                        g_sys.ssid.assign(buf, n > 0 ? n : 0);
+                    }
+                    WlanFreeMemory(ca);
+                    break;
+                }
+            }
+            WlanFreeMemory(list);
+        }
+        WlanCloseHandle(h, nullptr);
+    }
+}
+
+static void SysPollBattery() {
+    SYSTEM_POWER_STATUS ps{};
+    if (!GetSystemPowerStatus(&ps)) { g_sys.haveBat = false; return; }
+    g_sys.acLine = (ps.ACLineStatus == 1);
+    bool noBat = (ps.BatteryFlag == 255) || (ps.BatteryFlag & 128);   // 128 = no system battery
+    g_sys.haveBat = !noBat;
+    g_sys.bat = (ps.BatteryLifePercent <= 100) ? ps.BatteryLifePercent : 0;
+    g_sys.charging = (ps.BatteryFlag & 8) != 0;                       // 8 = charging
+}
+
+static void SysPoll() {
+    if (!g_cfg.sysTray) return;
+    if (g_cfg.sysVolume)  SysPollVolume();  else g_sys.haveVol = false;
+    if (g_cfg.sysNetwork) SysPollNetwork(); else g_sys.net = 0;
+    if (g_cfg.sysBattery) SysPollBattery(); else g_sys.haveBat = false;
+}
+static void SysRelease() {
+    VolDrop();
+    if (g_nlm) { g_nlm->Release(); g_nlm = nullptr; }
+}
+
+// The battery tile appears only on a laptop; volume and network always show when enabled.
+static bool SysTileVisible(int tile) {
+    if (!g_cfg.sysTray) return false;
+    if (tile == SYS_VOL) return g_cfg.sysVolume;
+    if (tile == SYS_NET) return g_cfg.sysNetwork;
+    if (tile == SYS_BAT) return g_cfg.sysBattery && g_sys.haveBat;
+    return false;
+}
+static int SysTileCount() {
+    int n = 0;
+    for (int t = 0; t < 3; ++t) if (SysTileVisible(t)) ++n;
+    return n;
+}
+
+static std::wstring SysTipText(int tile) {
+    wchar_t buf[128];
+    if (tile == SYS_VOL) {
+        if (!g_sys.haveVol) return L"Volume unavailable";
+        if (g_sys.mute || g_sys.vol == 0) return L"Volume: muted";
+        wsprintfW(buf, L"Volume: %d%%", g_sys.vol);
+        return buf;
+    }
+    if (tile == SYS_NET) {
+        if (g_sys.net == 0) return L"Network: disconnected";
+        std::wstring s;
+        if (g_sys.netType == 1) {
+            if (!g_sys.ssid.empty()) { wsprintfW(buf, L"Wi-Fi: %s", g_sys.ssid.c_str()); s = buf; }
+            else s = L"Wi-Fi";
+            wsprintfW(buf, L"  (%d%%)", g_sys.wifiQual);
+            s += buf;
+        } else s = L"Wired network";
+        if (g_sys.net == 1) s += L" - no internet";
+        return s;
+    }
+    if (tile == SYS_BAT) {
+        if (!g_sys.haveBat) return L"";
+        wsprintfW(buf, L"Battery: %d%%%s", g_sys.bat,
+                  g_sys.charging ? L" (charging)" : g_sys.acLine ? L" (plugged in)" : L"");
+        return buf;
+    }
+    return L"";
+}
+
+// ---- glyphs, drawn with GDI+ so they stay crisp at any tile size ----
+namespace SysGlyph {
+using namespace Gdiplus;
+
+static void Volume(Graphics& g, RectF a, COLORREF lit, COLORREF dim, bool muted, int vol) {
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    float s = std::min(a.Width, a.Height);
+    float cx = a.X + a.Width / 2, cy = a.Y + a.Height / 2;
+    SolidBrush body(GpColor(lit));
+    // speaker: a throat rectangle on the left, opening into a trapezoidal cone whose mouth faces right
+    float bh = s * 0.24f, bw = s * 0.12f;
+    float bx = cx - s * 0.30f;
+    g.FillRectangle(&body, bx, cy - bh / 2, bw, bh);
+    float mouthX = cx - s * 0.02f, coneH = s * 0.48f;
+    PointF cone[4] = { PointF(bx + bw, cy - bh / 2), PointF(mouthX, cy - coneH / 2),
+                       PointF(mouthX, cy + coneH / 2), PointF(bx + bw, cy + bh / 2) };
+    g.FillPolygon(&body, cone, 4);
+    float wx = mouthX + s * 0.06f;
+    if (muted || vol <= 0) {                         // a red slash through the waves = muted
+        Pen x(GpColor(RGB(230, 90, 90)), std::max(1.6f, s * 0.08f));
+        x.SetStartCap(LineCapRound); x.SetEndCap(LineCapRound);
+        g.DrawLine(&x, wx, cy - s * 0.18f, wx + s * 0.30f, cy + s * 0.18f);
+        g.DrawLine(&x, wx, cy + s * 0.18f, wx + s * 0.30f, cy - s * 0.18f);
+    } else {
+        int waves = vol >= 66 ? 3 : vol >= 33 ? 2 : 1;
+        for (int i = 0; i < 3; ++i) {
+            float r = s * (0.14f + i * 0.12f);
+            Pen arc(GpColor(i < waves ? lit : dim, i < waves ? 255 : 80), std::max(1.3f, s * 0.07f));
+            arc.SetStartCap(LineCapRound); arc.SetEndCap(LineCapRound);
+            g.DrawArc(&arc, mouthX - r, cy - r, 2 * r, 2 * r, -46.0f, 92.0f);
+        }
+    }
+}
+
+static void Wifi(Graphics& g, RectF a, COLORREF lit, COLORREF dim, int qual, bool warn) {
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    float s = std::min(a.Width, a.Height);
+    float cx = a.X + a.Width / 2, cy = a.Y + a.Height * 0.70f;
+    int bars = qual >= 75 ? 4 : qual >= 50 ? 3 : qual >= 25 ? 2 : 1;
+    for (int i = 0; i < 4; ++i) {
+        float r = s * (0.14f + i * 0.14f);
+        bool on = i < bars;
+        Pen arc(GpColor(on ? lit : dim, on ? 255 : 80), std::max(1.3f, s * 0.07f));
+        arc.SetStartCap(LineCapRound); arc.SetEndCap(LineCapRound);
+        g.DrawArc(&arc, cx - r, cy - r, 2 * r, 2 * r, -135.0f, 90.0f);
+    }
+    SolidBrush dot(GpColor(lit));
+    float dr = std::max(1.5f, s * 0.05f);
+    g.FillEllipse(&dot, cx - dr, cy - dr, 2 * dr, 2 * dr);
+    if (warn) {                                      // small amber dot = connected, no internet
+        SolidBrush w(GpColor(RGB(255, 170, 40)));
+        float r = s * 0.11f;
+        g.FillEllipse(&w, a.X + a.Width - 2 * r, a.Y, 2 * r, 2 * r);
+    }
+}
+
+static void Wired(Graphics& g, RectF a, COLORREF lit, COLORREF dim, int net) {
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    float s = std::min(a.Width, a.Height);
+    float cx = a.X + a.Width / 2, cy = a.Y + a.Height / 2;
+    COLORREF c = net ? lit : dim;
+    SolidBrush br(GpColor(c));
+    Pen pen(GpColor(c), std::max(1.3f, s * 0.07f));
+    // a little LAN plug: a body with two prongs on top and a lead coming down
+    float bw = s * 0.44f, bh = s * 0.30f;
+    g.FillRectangle(&br, cx - bw / 2, cy - bh * 0.18f, bw, bh);
+    float pr = s * 0.12f, pw = bw * 0.18f;
+    g.FillRectangle(&br, cx - bw * 0.30f, cy - bh * 0.18f - pr, pw, pr);
+    g.FillRectangle(&br, cx + bw * 0.12f, cy - bh * 0.18f - pr, pw, pr);
+    g.DrawLine(&pen, cx, cy + bh * 0.12f, cx, cy + bh * 0.12f + s * 0.20f);
+    if (net == 0) {                                  // red slash across the plug = no link
+        Pen slash(GpColor(RGB(230, 90, 90)), std::max(1.8f, s * 0.09f));
+        slash.SetStartCap(LineCapRound); slash.SetEndCap(LineCapRound);
+        g.DrawLine(&slash, cx - s * 0.42f, cy + s * 0.42f, cx + s * 0.42f, cy - s * 0.42f);
+    } else if (net == 1) {                           // amber dot = connected but no internet
+        SolidBrush w(GpColor(RGB(255, 170, 40)));
+        float r = s * 0.12f;
+        g.FillEllipse(&w, a.X + a.Width - 2 * r, a.Y, 2 * r, 2 * r);
+    }
+}
+
+static void Battery(Graphics& g, RectF a, int pct, bool charging, bool ac, COLORREF lit, COLORREF dim) {
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    float s = std::min(a.Width, a.Height);
+    float bw = a.Width * 0.72f, bh = s * 0.46f;
+    float bx = a.X + (a.Width - bw) / 2 - s * 0.04f, by = a.Y + (a.Height - bh) / 2;
+    float nub = s * 0.07f;
+    COLORREF fill = pct <= 10 ? RGB(230, 76, 60) : pct <= 25 ? RGB(240, 170, 40) : RGB(96, 204, 110);
+    if (charging || ac) fill = RGB(96, 204, 110);
+    Pen shell(GpColor(lit), std::max(1.2f, s * 0.05f));
+    g.DrawRectangle(&shell, bx, by, bw, bh);
+    SolidBrush nb(GpColor(lit));
+    g.FillRectangle(&nb, bx + bw, by + bh * 0.28f, nub, bh * 0.44f);
+    float pad = std::max(1.0f, s * 0.05f);
+    float fw = (bw - 2 * pad) * std::max(0, std::min(100, pct)) / 100.0f;
+    SolidBrush fb(GpColor(fill));
+    if (fw > 0) g.FillRectangle(&fb, bx + pad, by + pad, fw, bh - 2 * pad);
+    if (charging) {                                  // a lightning bolt over the cell, edged white so it reads on any fill
+        float mx = bx + bw / 2, my = by + bh / 2, u = bh * 0.46f;
+        PointF z[6] = { PointF(mx + u * 0.18f, my - u),     PointF(mx - u * 0.45f, my + u * 0.16f),
+                        PointF(mx - u * 0.02f, my + u * 0.16f), PointF(mx - u * 0.18f, my + u),
+                        PointF(mx + u * 0.45f, my - u * 0.16f), PointF(mx + u * 0.02f, my - u * 0.16f) };
+        SolidBrush fill(GpColor(RGB(24, 24, 24)));
+        Pen edge(GpColor(RGB(255, 255, 255)), std::max(1.0f, s * 0.035f));
+        g.FillPolygon(&fill, z, 6);
+        g.DrawPolygon(&edge, z, 6);
+    }
+    (void)dim;
+}
+} // namespace SysGlyph
+
+// Lays the visible tiles across the well, draws each as a bevel face with its glyph, and records a
+// K_SYS row per tile so hover, click and wheel work through the usual paths.
+static void DrawSysTray(HDC dc, RECT well) {
+    using namespace Gdiplus;
+    int n = SysTileCount();
+    if (n <= 0) return;
+    int sp = g_cfg.spacing;
+    int totalW = well.right - well.left;
+    int tileW = (totalW - sp * (n - 1)) / n;
+    COLORREF lit = g_cfg.text, dim = g_cfg.dim;
+    Graphics g(dc);
+    g.SetPixelOffsetMode(PixelOffsetModeHalf);
+
+    int x = well.left, slot = 0;
+    for (int tile = 0; tile < 3; ++tile) {
+        if (!SysTileVisible(tile)) continue;
+        int w = (slot == n - 1) ? well.right - x : tileW;    // last tile eats the rounding remainder
+        RECT r{x, well.top, x + w, well.bottom};
+        bool hov = g_hoverKind == K_SYS && g_hoverIdx == tile;
+        DrawButton(dc, r, false, g_cfg.outline, HoverFace(g_cfg.sysFace, hov), lit, {});
+        g_rows.push_back(Row{r, K_SYS, tile, r.top, r.bottom});
+
+        float m = 3.0f;                                       // inset for the glyph
+        RectF ga(r.left + m, r.top + m, w - 2 * m, (r.bottom - r.top) - 2 * m);
+        if (tile == SYS_VOL)
+            SysGlyph::Volume(g, ga, g_sys.haveVol ? lit : dim, dim,
+                             !g_sys.haveVol || g_sys.mute || g_sys.vol == 0, g_sys.vol);
+        else if (tile == SYS_NET) {
+            if (g_sys.netType == 1) SysGlyph::Wifi(g, ga, lit, dim, g_sys.wifiQual, g_sys.net == 1);
+            else SysGlyph::Wired(g, ga, lit, dim, g_sys.net);
+        } else if (tile == SYS_BAT)
+            SysGlyph::Battery(g, ga, g_sys.bat, g_sys.charging, g_sys.acLine, lit, dim);
+        x += w + sp;
+        ++slot;
+    }
+}
+
+// Opens a Windows settings page / flyout for a tile (same destinations the real tray icons use).
+static void SysTileAction(int tile, bool right) {
+    const wchar_t* uri = nullptr;
+    if (tile == SYS_VOL)      uri = right ? L"ms-settings:sound" : nullptr;        // left = mute, handled by caller
+    else if (tile == SYS_NET) uri = right ? L"ms-availablenetworks:" : L"ms-settings:network-status";
+    else if (tile == SYS_BAT) uri = right ? L"ms-settings:powersleep" : L"ms-settings:batterysaver";
+    if (uri) ShellExecuteW(nullptr, L"open", uri, nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+// ---- hover tooltip for the tiles ----
+static HWND g_sysTip = nullptr;
+static void SysTipInit(HWND bar) {
+    g_sysTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                               WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, 0, 0, 0, 0, bar, nullptr, nullptr, nullptr);
+    if (!g_sysTip) return;
+    TOOLINFOW ti{};
+    ti.cbSize = sizeof(ti);
+    ti.uFlags = TTF_TRACK | TTF_ABSOLUTE;
+    ti.hwnd = bar;
+    ti.uId = 1;
+    ti.lpszText = (LPWSTR)L"";
+    SendMessageW(g_sysTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+    SendMessageW(g_sysTip, TTM_SETMAXTIPWIDTH, 0, 320);
+}
+static void SysTipHide() {
+    if (g_sysTip) SendMessageW(g_sysTip, TTM_TRACKACTIVATE, FALSE, 0);
+}
+static void SysTipShow(HWND bar, int tile) {
+    if (!g_sysTip) return;
+    std::wstring text = SysTipText(tile);
+    if (text.empty()) { SysTipHide(); return; }
+    const Row* row = nullptr;
+    for (auto& r : g_rows) if (r.kind == K_SYS && r.idx == tile) { row = &r; break; }
+    if (!row) { SysTipHide(); return; }
+    TOOLINFOW ti{};
+    ti.cbSize = sizeof(ti);
+    ti.uFlags = TTF_TRACK | TTF_ABSOLUTE;
+    ti.hwnd = bar;
+    ti.uId = 1;
+    ti.lpszText = (LPWSTR)text.c_str();
+    SendMessageW(g_sysTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+    POINT pt{row->r.left, row->r.top - 2};
+    ClientToScreen(bar, &pt);
+    SendMessageW(g_sysTip, TTM_TRACKPOSITION, 0, MAKELPARAM(pt.x + 4, pt.y));
+    SendMessageW(g_sysTip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&ti);
+}
+
 // ---------- actions ----------
 
 // Brings h to the front without SwitchToThisWindow's slow animated path.
@@ -3737,6 +4181,8 @@ static void Reload() {
     for (auto& t : g_tasks) UpdateGeometry(t);
     RequestStartPins();
     StartMeterTimer();
+    if (g_cfg.sysTray) { SysPoll(); SetTimer(g_hwnd, TIMER_SYS, 1000, nullptr); }   // follow a settings toggle
+    else { KillTimer(g_hwnd, TIMER_SYS); SysTipHide(); }
     if (!g_cfg.terminal || (g_term.started && g_term.kind != ShellKind())) TermStop();
     RegisterTermHotkey();
     g_termVisDirty = true;
@@ -4024,6 +4470,25 @@ static const SwOpt kSwOpts[] = {
           L"Leave blank for none."),
     SW_INT(L"pinsmax", L"Most of the bar", 10, 100, L"%",
            L"The largest share of the bar's height the pinned apps can take. Past that, the section scrolls."),
+
+    SW_PAGE(L"System tray",
+            L"A small well of the familiar Windows status icons, between the pinned apps and the clock: speaker "
+            L"volume, network, and battery. Hover any of them for details."),
+    SW_BOOL(L"systray", L"Show the system tray",
+            L"The whole indicator well. Turn it off to hide the icons and give the pinned apps the room back."),
+    SW_INT(L"systileh", L"Row height", 14, 64, L"px", L"How tall the row of indicators is."),
+    SW_HEAD(L"Volume"),
+    SW_BOOL(L"sysvolume", L"Speaker volume",
+            L"The speaker icon. Wheel over it to change the volume, left-click to mute or unmute, right-click for "
+            L"sound settings."),
+    SW_INT(L"volumestep", L"Wheel step", 1, 25, L"%", L"How much one notch of the mouse wheel changes the volume."),
+    SW_HEAD(L"Network"),
+    SW_BOOL(L"sysnetwork", L"Network",
+            L"Wi-Fi strength or a wired plug, with an amber dot when there's no internet. Left-click opens network "
+            L"settings, right-click the Wi-Fi list."),
+    SW_HEAD(L"Battery"),
+    SW_BOOL(L"sysbattery", L"Battery",
+            L"Charge level and a bolt while charging. Shows only on a laptop. Left-click opens power settings."),
 
     SW_PAGE(L"Colours", L"Colours for the whole bar. Click a swatch to pick one, or type a hex code such as #2F7DFF."),
     SW_HEAD(L"Buttons"),
@@ -6405,6 +6870,7 @@ static void SetHover(int k, int i) {
         if (g_cfg.hoverDelay == 0) HoverRaise(i);
         else SetTimer(g_hwnd, TIMER_HOVER, g_cfg.hoverDelay, nullptr);
     }
+    if (k == K_SYS) SysTipShow(g_hwnd, i); else SysTipHide();
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -6553,6 +7019,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         } else if (wp == TIMER_METER) {
             if (AudioTick()) InvalidateRect(hwnd, nullptr, FALSE);
+        } else if (wp == TIMER_SYS) {
+            if (g_cfg.sysTray) {
+                SysState prev = g_sys;
+                SysPoll();
+                if (prev.haveVol != g_sys.haveVol || prev.vol != g_sys.vol || prev.mute != g_sys.mute ||
+                    prev.net != g_sys.net || prev.netType != g_sys.netType || prev.wifiQual != g_sys.wifiQual ||
+                    prev.haveBat != g_sys.haveBat || prev.bat != g_sys.bat || prev.charging != g_sys.charging ||
+                    prev.acLine != g_sys.acLine)
+                    InvalidateRect(hwnd, nullptr, FALSE);
+            }
         } else if (wp == TIMER_CLOCK && g_cfg.clock) {
             SYSTEMTIME st;
             GetLocalTime(&st);
@@ -6586,6 +7062,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSELEAVE:
         KillTimer(hwnd, TIMER_HOVER);
         g_tracking = false;
+        SysTipHide();
         if (g_hoverKind == K_CLOCK && g_watchHwnd) InvalidateRect(g_watchHwnd, nullptr, FALSE);
         g_hoverKind = K_NONE;
         g_hoverIdx = -1;
@@ -6608,6 +7085,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (pt.y >= g_pinsTop && pt.y < g_pinsBottom) {
             g_scrollPins -= delta / WHEEL_DELTA * (g_lineH + g_cfg.vpad) * 3;
             InvalidateRect(hwnd, nullptr, FALSE);
+        } else if (g_sysBottom && pt.y >= g_sysTop && pt.y < g_sysBottom) {
+            const Row* r = HitTest(pt.x, pt.y);          // wheel over the volume tile changes the volume
+            if (r && r->kind == K_SYS && r->idx == SYS_VOL) {
+                SysVolumeNudge(delta > 0 ? +1 : -1);
+                SysTipShow(hwnd, SYS_VOL);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
         }
         return 0;
     }
@@ -6655,6 +7139,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (const Row* r = HitTest(x, y)) {
             if (r->kind == K_START) { PressKeys({VK_LWIN}); return 0; }
             if (r->kind == K_CLOCK) { CalToggle(); return 0; }
+            if (r->kind == K_SYS) {
+                if (r->idx == SYS_VOL) { SysVolumeMuteToggle(); SysTipShow(hwnd, SYS_VOL); InvalidateRect(hwnd, nullptr, FALSE); }
+                else SysTileAction(r->idx, false);
+                return 0;
+            }
             if (r->kind == K_PIN && r->idx < PinCount()) LaunchPin(PinAt(r->idx));
         }
         if (RefreshTasks()) PvSync();
@@ -6682,6 +7171,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             idx = r->idx;
         }
         if (kind == K_START) { PressKeys({VK_LWIN, 'X'}); return 0; }
+        if (kind == K_SYS) { SysTileAction(idx, true); return 0; }
         ClientToScreen(hwnd, &pt);
         if (kind == K_TERM) ShowTermMenu(pt);
         else if (kind == K_PIN && idx < PinCount()) ShowPinMenu(idx, pt);
@@ -6702,12 +7192,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_DESTROY:
         for (UINT_PTR id : {TIMER_SCAN, TIMER_CLOCK, TIMER_HOVER, TIMER_METER, TIMER_BLINK,
-                            TIMER_ANIM, TIMER_RECENTER, TIMER_CARET, TIMER_TERMEXIT})
+                            TIMER_ANIM, TIMER_RECENTER, TIMER_CARET, TIMER_TERMEXIT, TIMER_SYS})
             KillTimer(hwnd, id);
         UnregisterHotKey(hwnd, HOTKEY_TERM);
         TermStop();
         for (auto& t : g_tasks) ThumbRelease(t);
         AudioRelease();
+        SysRelease();
+        if (g_sysTip) { DestroyWindow(g_sysTip); g_sysTip = nullptr; }
         if (g_mmEnum) { g_mmEnum->Release(); g_mmEnum = nullptr; }
         DeregisterShellHookWindow(hwnd);
         AppBarRemove();
@@ -6756,6 +7248,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 
     Gdiplus::GdiplusStartupInput gdipIn;
     Gdiplus::GdiplusStartup(&g_gdipToken, &gdipIn, nullptr);
+    INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_WIN95_CLASSES};
+    InitCommonControlsEx(&icc);                  // tooltip control for the system-tray hover text
 
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -6801,8 +7295,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     RequestStartPins();
     RegisterTermHotkey();
 
+    SysTipInit(g_hwnd);
+    SysPoll();                                   // fill the indicators before the first paint
     SetTimer(g_hwnd, TIMER_SCAN, 500, nullptr);
     SetTimer(g_hwnd, TIMER_CLOCK, 1000, nullptr);
+    if (g_cfg.sysTray) SetTimer(g_hwnd, TIMER_SYS, 1000, nullptr);
     StartMeterTimer();
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
     UpdateWindow(g_hwnd);
