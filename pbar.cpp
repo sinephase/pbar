@@ -49,6 +49,7 @@
 #include <wlanapi.h>
 #include <iphlpapi.h>
 #include <commctrl.h>
+#include <timeapi.h>
 #include <objidl.h>
 namespace Gdiplus { using std::min; using std::max; }   // GDI+'s headers expect min/max (NOMINMAX removes them)
 #include <gdiplus.h>
@@ -66,6 +67,7 @@ namespace Gdiplus { using std::min; using std::max; }   // GDI+'s headers expect
 #pragma comment(lib, "wlanapi.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "winmm.lib")
 #endif
 
 #ifndef MOD_NOREPEAT
@@ -126,8 +128,8 @@ namespace Gdiplus { using std::min; using std::max; }   // GDI+'s headers expect
 #define IDM_TERM_SH_CMD    412
 
 enum Kind { K_PIN = 0, K_TASK = 1, K_CLOCK = 2, K_START = 3, K_TERM = 4, K_SYS = 5, K_NONE = -1 };
-// K_SYS row idx: which indicator tile the row is
-enum SysTile { SYS_VOL = 0, SYS_NET = 1, SYS_BAT = 2 };
+// K_SYS row idx: which indicator the row is (SYS_DL is the full-width Steam download bar)
+enum SysTile { SYS_VOL = 0, SYS_NET = 1, SYS_BAT = 2, SYS_DL = 3 };
 
 // A 2-bit icon: every pixel is transparent or one of three grey shades, stored ready to AlphaBlend.
 struct Icon2 { HBITMAP bmp = nullptr; int size = 0; ~Icon2() { if (bmp) DeleteObject(bmp); } };
@@ -157,8 +159,10 @@ struct Task {
     RECT inset{0, 0, 0, 0};        // invisible resize borders (or the frame, with clientonly) cropped away
     bool insetValid = false;
     float aspect = 0.5625f;        // height / width of what's shown
-    // column layout in client coords: where the card is heading (t*) and where it is now (c*)
+    // column layout in client coords: where the card is heading (t*), where it is now (c*), and where
+    // the current glide started from (s*)
     float tTop = 0, tH = 0, tW = 0, tX = 0, cTop = 0, cH = 0, cW = 0, cX = 0;
+    float sTop = 0, sH = 0, sW = 0, sX = 0;
     bool placed = false, inLayout = false;
 };
 struct Row  { RECT r; int kind; int idx; int clipTop; int clipBottom; };
@@ -180,7 +184,7 @@ struct Config {
     bool startColorSet = false;
     int meterH = 2, meterFall = 4, meterDb = 48, meterFps = 30;
     // system indicators (volume / network / battery), in a well between the pins and the clock
-    bool sysTray = true, sysVolume = true, sysNetwork = true, sysBattery = true;
+    bool sysTray = true, sysVolume = true, sysNetwork = true, sysBattery = true, steamDownload = true;
     int sysTileH = 24, volumeStep = 4;
     COLORREF sysFace = RGB(64, 64, 64);
     bool sysFaceSet = false;
@@ -774,6 +778,8 @@ static const char* kDefaultIni =
 "systileh=24\n"
 "; how many percent one wheel notch changes the volume\n"
 "volumestep=4\n"
+"; show a progress bar while Steam is downloading a game (read from Steam's own files)\n"
+"steamdownload=1\n"
 "; face colour of the indicator well (blank = same as the pinned buttons)\n"
 "; sysface=#404040\n"
 "\n"
@@ -879,6 +885,7 @@ static void LoadConfig() {
         else if (k == L"sysbattery")  g_cfg.sysBattery = n != 0;
         else if (k == L"systileh")    g_cfg.sysTileH = std::max(14, std::min(64, n));
         else if (k == L"volumestep")  g_cfg.volumeStep = std::max(1, std::min(25, n));
+        else if (k == L"steamdownload") g_cfg.steamDownload = n != 0;
         else if (k == L"sysface")     { g_cfg.sysFace = ParseColor(v, g_cfg.sysFace); g_cfg.sysFaceSet = true; }
         else if (k == L"bg")          g_cfg.bg = ParseColor(v, g_cfg.bg);
         else if (k == L"face")        g_cfg.face = ParseColor(v, g_cfg.face);
@@ -1002,7 +1009,9 @@ static void LoadConfig() {
                               L"; height of the indicator row in px\r\n"
                               L"systileh=24\r\n"
                               L"; how many % the wheel changes the volume by over the speaker\r\n"
-                              L"volumestep=4\r\n");
+                              L"volumestep=4\r\n"
+                              L"; progress bar while Steam is downloading a game\r\n"
+                              L"steamdownload=1\r\n");
         }
         SetIniValue(L"configver", std::to_wstring(PBAR_CONFIGVER));
         g_cfg.configVer = PBAR_CONFIGVER;
@@ -1905,39 +1914,80 @@ static void PvComputeTargets() {
     for (int k = pa - 1; k >= 0; --k) { y -= h[ord[k]]; set(ord[k], y); y -= g_cfg.spacing; }
 }
 
-// One animation frame: every card moves part of the way to its target. Cards whose target jumped
-// across the column (wrapping from one end to the other) snap instead of flying through the middle.
-static bool PvStep() {
-    float k = std::max(0.01f, std::min(1.0f, g_cfg.animSpeed / 100.0f));
-    float jump = (g_pvBottom - g_pvTop) * 0.6f;
-    bool moving = false;
+// Preview motion. When an interaction (hover, wheel, re-centre, window-list change) sets new targets,
+// PvAnimate() snapshots where every card is right now and stamps a start time; PvStep() then eases
+// each card from that snapshot toward its target along an ease-out curve over a short, animspeed-derived
+// duration. The glide is computed from wall-clock time, so it responds immediately and decelerates into
+// place (a touch-like slide, not a snap), and we render a frame per monitor refresh so there are as
+// many in-between states as the screen can show. Cards whose target jumped across the column (wrapping
+// end to end) snap, so they don't fly through the middle.
+static LARGE_INTEGER g_qpf = {}, g_animT0 = {};
+static int g_frameMs = 15;
+
+// While a transition runs we raise the timer resolution to 1 ms (bracketed, so no idle cost) and fire
+// a frame every monitor refresh -- the cheapest way to get a smooth state per vblank without burning
+// frames the display can't show.
+static bool g_hiRes = false;
+static void PvUpdateFrameMs() {
+    int hz = 60;
+    HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFOEXW mi{}; mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(mon, &mi)) {
+        DEVMODEW dm{}; dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+            hz = (int)dm.dmDisplayFrequency;
+    }
+    g_frameMs = std::max(6, std::min(16, (int)std::lround(1000.0 / hz)));   // one frame per refresh, 60-166 Hz
+}
+static void AnimClock(bool on) {
+    if (on == g_hiRes) return;
+    if (on) { timeBeginPeriod(1); PvUpdateFrameMs(); } else timeEndPeriod(1);
+    g_hiRes = on;
+}
+
+static int PvDurationMs() {
+    int d = (int)std::lround((100 - g_cfg.animSpeed) * 2.2f + 50.0f);   // animspeed 35 -> ~193 ms, 100 -> 50 ms
+    return std::max(30, std::min(1000, d));
+}
+static void PvSnapshot() {                            // mark where each card is, and when, as the glide's start
+    if (g_qpf.QuadPart == 0) QueryPerformanceFrequency(&g_qpf);
+    QueryPerformanceCounter(&g_animT0);
     for (auto& t : g_tasks) {
         if (!t.inLayout) continue;
-        if (!t.placed || k >= 1.0f || std::fabs(t.tTop - t.cTop) > jump) {
-            t.cTop = t.tTop;
-            t.cH = t.tH;
-            t.cW = t.tW;
-            t.cX = t.tX;
-            t.placed = true;
+        if (!t.placed) { t.cTop = t.tTop; t.cH = t.tH; t.cW = t.tW; t.cX = t.tX; t.placed = true; }
+        t.sTop = t.cTop; t.sH = t.cH; t.sW = t.cW; t.sX = t.cX;
+    }
+}
+
+static bool PvStep() {
+    if (g_qpf.QuadPart == 0) QueryPerformanceFrequency(&g_qpf);
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    float p = (float)((now.QuadPart - g_animT0.QuadPart) * 1000.0 / g_qpf.QuadPart) / (float)PvDurationMs();
+    if (p < 0) p = 0;
+    bool done = p >= 1.0f;
+    if (done) p = 1.0f;
+    float e = 1.0f - std::pow(1.0f - p, 3.0f);   // ease-out cubic: moves at once, decelerates into place
+    float jump = (g_pvBottom - g_pvTop) * 0.6f;
+    for (auto& t : g_tasks) {
+        if (!t.inLayout) continue;
+        if (!t.placed || done || std::fabs(t.tTop - t.sTop) > jump) {   // first placement, finished, or a wrap: snap
+            t.cTop = t.tTop; t.cH = t.tH; t.cW = t.tW; t.cX = t.tX; t.placed = true;
             continue;
         }
-        auto approach = [&](float& c, float tg) {
-            float d = tg - c;
-            if (std::fabs(d) < 0.5f) c = tg;
-            else { c += d * k; moving = true; }
-        };
-        approach(t.cTop, t.tTop);
-        approach(t.cH, t.tH);
-        approach(t.cW, t.tW);
-        approach(t.cX, t.tX);
+        t.cTop = t.sTop + (t.tTop - t.sTop) * e;
+        t.cH   = t.sH   + (t.tH   - t.sH)   * e;
+        t.cW   = t.sW   + (t.tW   - t.sW)   * e;
+        t.cX   = t.sX   + (t.tX   - t.sX)   * e;
     }
-    return moving;
+    return !done;
 }
 
 static void PvAnimate() {
     PvComputeTargets();
+    PvSnapshot();                                     // re-base the glide on wherever the cards are now
     if (g_hwnd) {
-        SetTimer(g_hwnd, TIMER_ANIM, 15, nullptr);
+        AnimClock(true);
+        SetTimer(g_hwnd, TIMER_ANIM, g_frameMs, nullptr);
         InvalidateRect(g_hwnd, nullptr, FALSE);
     }
 }
@@ -3390,6 +3440,8 @@ static void WatchPlace(const RECT* r) {
 
 static int SysTileCount();                      // system-indicator well (defined after the audio section)
 static void DrawSysTray(HDC dc, RECT well);
+static bool SteamBarOn();
+static void DrawSteamBar(HDC dc, RECT r);
 
 static void Paint(HWND hwnd) {
     PAINTSTRUCT ps;
@@ -3466,9 +3518,14 @@ static void Paint(HWND hwnd) {
     int clockTop = (g_cfg.startButton ? startTop - g_cfg.spacing : H) - clockH;
     int belowPins = g_cfg.clock ? clockTop - g_cfg.gap
                   : g_cfg.startButton ? startTop - g_cfg.gap : H;
-    // System-indicator well, carved just above the clock; the pinned section stops above it.
+    // System-indicator well, carved just above the clock; the pinned section stops above it. The well
+    // holds an optional row of tiles (volume/network/battery) and, while Steam is downloading, a
+    // full-width progress bar below them.
     int sysN = SysTileCount();
-    int sysH = (g_cfg.sysTray && sysN > 0) ? std::min(g_cfg.sysTileH, std::max(0, belowPins / 3)) : 0;
+    int tileRowH = (g_cfg.sysTray && sysN > 0) ? g_cfg.sysTileH : 0;
+    int dlBarH = SteamBarOn() ? std::max(14, g_cfg.sysTileH * 3 / 5) : 0;
+    int innerGap = (tileRowH && dlBarH) ? 2 : 0;
+    int sysH = std::min(tileRowH + innerGap + dlBarH, std::max(0, belowPins / 2));
     int sysBot = belowPins, sysTopY = belowPins - sysH;
     int bottomLimit = sysH ? sysTopY - g_cfg.gap : belowPins;
     g_sysTop = sysH ? sysTopY : 0;
@@ -3501,7 +3558,7 @@ static void Paint(HWND hwnd) {
                  std::fabs(t.cW - t.tW) >= 0.5f || std::fabs(t.cX - t.tX) >= 0.5f)
             needAnim = true;
     }
-    if (needAnim) SetTimer(hwnd, TIMER_ANIM, 15, nullptr);
+    if (needAnim) { AnimClock(true); SetTimer(hwnd, TIMER_ANIM, g_frameMs, nullptr); }
 
     // Indicator sits on the inner edge (away from the screen edge the bar is docked to).
     int nx0 = g_cfg.rightSide ? sbW + sbGap : 0, nx1 = g_cfg.rightSide ? W : W - sbW - sbGap;
@@ -3512,7 +3569,10 @@ static void Paint(HWND hwnd) {
     DrawPreviews(mdc);
     DrawPins(mdc, W, pinsScroll ? nx0 : 0, pinsScroll ? nx1 : W, pins, g_pinsTop, g_pinsBottom,
              g_scrollPins, pinsContent, pinsScroll ? sbX : -1);
-    if (sysH) { RECT sw{0, sysTopY, W, sysBot}; DrawSysTray(mdc, sw); }
+    if (sysH) {
+        if (tileRowH) { RECT tr{0, sysTopY, W, sysTopY + tileRowH}; DrawSysTray(mdc, tr); }
+        if (dlBarH)   { RECT dr{0, sysBot - dlBarH, W, sysBot}; DrawSteamBar(mdc, dr); }
+    }
 
     if (g_cfg.clock) {
         RECT r{0, clockTop, W, clockTop + clockH};
@@ -3827,11 +3887,122 @@ static void SysPollBattery() {
     g_sys.charging = (ps.BatteryFlag & 8) != 0;                       // 8 = charging
 }
 
+// ---- Steam download progress ----
+// Windows' taskbar download bar comes from ITaskbarList3, which an app reports straight to Explorer
+// over a private channel there's no supported way to tap. Steam, though, writes every download's byte
+// progress into its own appmanifest_<id>.acf files, so we read those directly: find the Steam
+// libraries from the registry + libraryfolders.vdf, then scan each library's manifests for one that's
+// mid-download. No injection, no dependence on the real taskbar.
+struct SteamDL { std::wstring name; long long dled = 0, total = 0; int pct = 0; };
+static std::vector<std::wstring> g_steamLibs;     // each library's steamapps dir
+static DWORD g_steamLibsAt = 0;
+static std::vector<SteamDL> g_steamDls;
+
+static std::string FileBytes(const std::wstring& path, size_t cap = 16384) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return "";
+    std::string out; char buf[8192]; DWORD rd = 0;
+    while (out.size() < cap && ReadFile(f, buf, sizeof(buf), &rd, nullptr) && rd) out.append(buf, rd);
+    CloseHandle(f);
+    return out;
+}
+// VDF value: the first quoted token after the quoted key. Returns false if the key isn't present.
+static bool VdfValue(const std::string& s, const char* key, std::string& out, size_t from = 0) {
+    std::string pat = std::string("\"") + key + "\"";
+    size_t k = s.find(pat, from);
+    if (k == std::string::npos) return false;
+    size_t q1 = s.find('"', k + pat.size());
+    if (q1 == std::string::npos) return false;
+    size_t q2 = s.find('"', q1 + 1);
+    if (q2 == std::string::npos) return false;
+    out = s.substr(q1 + 1, q2 - q1 - 1);
+    return true;
+}
+static std::wstring VdfPathToW(std::string v) {              // collapse VDF's \\ escapes, then widen
+    std::string o; o.reserve(v.size());
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (v[i] == '\\' && i + 1 < v.size()) { o += v[i + 1]; ++i; }
+        else o += v[i];
+    }
+    std::wstring w = Utf8ToW(o);
+    for (auto& c : w) if (c == L'/') c = L'\\';
+    return w;
+}
+
+static void SteamFindLibs() {
+    g_steamLibs.clear();
+    wchar_t buf[512]; DWORD sz = sizeof(buf);
+    std::wstring steam;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath", RRF_RT_REG_SZ, nullptr, buf, &sz)
+            == ERROR_SUCCESS)
+        steam = buf;
+    if (steam.empty()) {
+        sz = sizeof(buf);
+        if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\WOW6432Node\\Valve\\Steam", L"InstallPath",
+                         RRF_RT_REG_SZ, nullptr, buf, &sz) == ERROR_SUCCESS)
+            steam = buf;
+    }
+    if (steam.empty()) return;
+    for (auto& c : steam) if (c == L'/') c = L'\\';
+    std::wstring mainApps = steam + L"\\steamapps";
+    g_steamLibs.push_back(mainApps);
+    std::string vdf = FileBytes(mainApps + L"\\libraryfolders.vdf", 65536);
+    size_t pos = 0; std::string p;
+    while (VdfValue(vdf, "path", p, pos)) {
+        std::wstring apps = VdfPathToW(p) + L"\\steamapps";
+        if (_wcsicmp(apps.c_str(), mainApps.c_str()) != 0) g_steamLibs.push_back(apps);
+        size_t at = vdf.find("\"path\"", pos);
+        pos = (at == std::string::npos) ? vdf.size() : at + 6;
+    }
+}
+
+static void SteamScan() {
+    g_steamDls.clear();
+    for (const auto& lib : g_steamLibs) {
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW((lib + L"\\appmanifest_*.acf").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            std::string txt = FileBytes(lib + L"\\" + fd.cFileName);
+            if (txt.empty()) continue;
+            std::string v;
+            int flags = VdfValue(txt, "StateFlags", v) ? atoi(v.c_str()) : 0;
+            if (flags == 4) continue;                                   // 4 = fully installed, idle
+            long long total = VdfValue(txt, "BytesToDownload", v) ? strtoll(v.c_str(), nullptr, 10) : 0;
+            long long dled  = VdfValue(txt, "BytesDownloaded", v) ? strtoll(v.c_str(), nullptr, 10) : 0;
+            if (total <= 0 || dled >= total) continue;                  // nothing actively pending
+            SteamDL d;
+            d.total = total; d.dled = dled;
+            d.pct = (int)(dled * 100 / total);
+            if (VdfValue(txt, "name", v)) d.name = Utf8ToW(v);
+            g_steamDls.push_back(std::move(d));
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+}
+
+static void SysPollSteam() {
+    DWORD now = GetTickCount();
+    if (g_steamLibs.empty() || now - g_steamLibsAt > 30000) { SteamFindLibs(); g_steamLibsAt = now; }
+    SteamScan();
+}
+
+// The download to surface when several are active: the one with the most left to go.
+static const SteamDL* SteamActive() {
+    const SteamDL* best = nullptr;
+    for (const auto& d : g_steamDls)
+        if (!best || (d.total - d.dled) > (best->total - best->dled)) best = &d;
+    return best;
+}
+static bool SteamBarOn() { return g_cfg.sysTray && g_cfg.steamDownload && !g_steamDls.empty(); }
+
 static void SysPoll() {
     if (!g_cfg.sysTray) return;
-    if (g_cfg.sysVolume)  SysPollVolume();  else g_sys.haveVol = false;
-    if (g_cfg.sysNetwork) SysPollNetwork(); else g_sys.net = 0;
-    if (g_cfg.sysBattery) SysPollBattery(); else g_sys.haveBat = false;
+    if (g_cfg.sysVolume)   SysPollVolume();  else g_sys.haveVol = false;
+    if (g_cfg.sysNetwork)  SysPollNetwork(); else g_sys.net = 0;
+    if (g_cfg.sysBattery)  SysPollBattery(); else g_sys.haveBat = false;
+    if (g_cfg.steamDownload) SysPollSteam(); else g_steamDls.clear();
 }
 static void SysRelease() {
     VolDrop();
@@ -3877,6 +4048,16 @@ static std::wstring SysTipText(int tile) {
         wsprintfW(buf, L"Battery: %d%%%s", g_sys.bat,
                   g_sys.charging ? L" (charging)" : g_sys.acLine ? L" (plugged in)" : L"");
         return buf;
+    }
+    if (tile == SYS_DL) {
+        const SteamDL* d = SteamActive();
+        if (!d) return L"";
+        std::wstring s = L"Steam ↓ ";
+        s += d->name.empty() ? L"download" : d->name;
+        wsprintfW(buf, L"  %d%%", d->pct);
+        s += buf;
+        if (g_steamDls.size() > 1) { wsprintfW(buf, L"  (+%d more)", (int)g_steamDls.size() - 1); s += buf; }
+        return s;
     }
     return L"";
 }
@@ -4029,12 +4210,61 @@ static void DrawSysTray(HDC dc, RECT well) {
     }
 }
 
+// Full-width Steam download bar: arrow, a green progress track, and the percentage. Shown only while a
+// download is active, and clickable (opens the Steam downloads page).
+static void DrawSteamBar(HDC dc, RECT r) {
+    using namespace Gdiplus;
+    const SteamDL* d = SteamActive();
+    if (!d) return;
+    bool hov = g_hoverKind == K_SYS && g_hoverIdx == SYS_DL;
+    DrawButton(dc, r, false, g_cfg.outline, HoverFace(g_cfg.sysFace, hov), g_cfg.text, {});
+    g_rows.push_back(Row{r, K_SYS, SYS_DL, r.top, r.bottom});
+
+    int H = r.bottom - r.top, pad = std::max(2, H / 6);
+    Graphics g(dc);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+
+    // download arrow sitting on a short tray line, on the left
+    float as = (float)(H - 2 * pad), ax = (float)(r.left + pad), ay = (float)(r.top + pad), cxA = ax + as / 2;
+    SolidBrush ink(GpColor(g_cfg.text));
+    g.FillRectangle(&ink, cxA - as * 0.11f, ay + as * 0.08f, as * 0.22f, as * 0.42f);        // shaft
+    PointF head[3] = { PointF(cxA - as * 0.30f, ay + as * 0.42f), PointF(cxA + as * 0.30f, ay + as * 0.42f),
+                       PointF(cxA, ay + as * 0.78f) };
+    g.FillPolygon(&ink, head, 3);                                                             // head
+    g.FillRectangle(&ink, ax, ay + as * 0.9f, as, std::max(1.0f, as * 0.14f));                // tray line
+
+    // percentage text at the far right (measured so the track stops short of it)
+    wchar_t pct[8]; wsprintfW(pct, L"%d%%", d->pct);
+    HGDIOBJ of = SelectObject(dc, g_font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, g_cfg.text);
+    SIZE ts; GetTextExtentPoint32W(dc, pct, (int)wcslen(pct), &ts);
+    int tx0 = (int)(ax + as) + pad, tx1 = r.right - pad - ts.cx - 3;
+    int th = std::max(4, H / 3), ty = r.top + (H - th) / 2;
+    if (tx1 > tx0 + 6) {
+        float rad = th / 2.0f;
+        GraphicsPath track, fill;
+        AddRoundRect(track, (float)tx0, (float)ty, (float)(tx1 - tx0), (float)th, rad);
+        SolidBrush tb(GpColor(g_cfg.dim, 110));
+        g.FillPath(&tb, &track);
+        int fw = (tx1 - tx0) * std::max(0, std::min(100, d->pct)) / 100;
+        if (fw > 2) {
+            AddRoundRect(fill, (float)tx0, (float)ty, (float)fw, (float)th, rad);
+            SolidBrush fb(GpColor(RGB(92, 176, 71)));                                         // Steam download green
+            g.FillPath(&fb, &fill);
+        }
+    }
+    ExtTextOutW(dc, r.right - pad - ts.cx, r.top + (H - ts.cy) / 2, 0, nullptr, pct, (UINT)wcslen(pct), nullptr);
+    SelectObject(dc, of);
+}
+
 // Opens a Windows settings page / flyout for a tile (same destinations the real tray icons use).
 static void SysTileAction(int tile, bool right) {
     const wchar_t* uri = nullptr;
     if (tile == SYS_VOL)      uri = right ? L"ms-settings:sound" : nullptr;        // left = mute, handled by caller
     else if (tile == SYS_NET) uri = right ? L"ms-availablenetworks:" : L"ms-settings:network-status";
     else if (tile == SYS_BAT) uri = right ? L"ms-settings:powersleep" : L"ms-settings:batterysaver";
+    else if (tile == SYS_DL)  uri = L"steam://open/downloads";
     if (uri) ShellExecuteW(nullptr, L"open", uri, nullptr, nullptr, SW_SHOWNORMAL);
 }
 
@@ -4489,6 +4719,10 @@ static const SwOpt kSwOpts[] = {
     SW_HEAD(L"Battery"),
     SW_BOOL(L"sysbattery", L"Battery",
             L"Charge level and a bolt while charging. Shows only on a laptop. Left-click opens power settings."),
+    SW_HEAD(L"Steam"),
+    SW_BOOL(L"steamdownload", L"Steam download bar",
+            L"While Steam is downloading a game, show a progress bar across the well (read from Steam's own "
+            L"files). Left-click opens the Steam downloads page. Nothing shows when Steam is idle."),
 
     SW_PAGE(L"Colours", L"Colours for the whole bar. Click a swatch to pick one, or type a hex code such as #2F7DFF."),
     SW_HEAD(L"Buttons"),
@@ -6988,7 +7222,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (t && IsWindowVisible(t)) ShowSystemTaskbars(false);
             }
         } else if (wp == TIMER_ANIM) {
-            if (!PvStep()) KillTimer(hwnd, TIMER_ANIM);
+            if (!PvStep()) { KillTimer(hwnd, TIMER_ANIM); AnimClock(false); }
             UpdateBarRegion();                            // reshape before the paint that draws the new frame
             InvalidateRect(hwnd, nullptr, FALSE);
         } else if (wp == TIMER_RECENTER) {
@@ -7022,11 +7256,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == TIMER_SYS) {
             if (g_cfg.sysTray) {
                 SysState prev = g_sys;
+                size_t prevDlN = g_steamDls.size();
+                const SteamDL* pa = SteamActive();
+                int prevPct = pa ? pa->pct : -1;
                 SysPoll();
+                const SteamDL* na = SteamActive();
                 if (prev.haveVol != g_sys.haveVol || prev.vol != g_sys.vol || prev.mute != g_sys.mute ||
                     prev.net != g_sys.net || prev.netType != g_sys.netType || prev.wifiQual != g_sys.wifiQual ||
                     prev.haveBat != g_sys.haveBat || prev.bat != g_sys.bat || prev.charging != g_sys.charging ||
-                    prev.acLine != g_sys.acLine)
+                    prev.acLine != g_sys.acLine ||
+                    prevDlN != g_steamDls.size() || prevPct != (na ? na->pct : -1))
                     InvalidateRect(hwnd, nullptr, FALSE);
             }
         } else if (wp == TIMER_CLOCK && g_cfg.clock) {
@@ -7194,6 +7433,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         for (UINT_PTR id : {TIMER_SCAN, TIMER_CLOCK, TIMER_HOVER, TIMER_METER, TIMER_BLINK,
                             TIMER_ANIM, TIMER_RECENTER, TIMER_CARET, TIMER_TERMEXIT, TIMER_SYS})
             KillTimer(hwnd, id);
+        AnimClock(false);
         UnregisterHotKey(hwnd, HOTKEY_TERM);
         TermStop();
         for (auto& t : g_tasks) ThumbRelease(t);
